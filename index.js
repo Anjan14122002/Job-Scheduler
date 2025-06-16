@@ -1,5 +1,6 @@
-const express = require("express");
-const bodyParser = require("body-parser");
+const express = require('express');
+const bodyParser = require('body-parser');
+const { Worker } = require('worker_threads');
 const app = express();
 const PORT = 3000;
 
@@ -8,6 +9,19 @@ let nextJobId = 1;
 
 app.use(bodyParser.json());
 
+function runJobInWorker(jobId) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(__dirname + '/job-worker.js', {
+      workerData: { id: jobId }
+    });
+    worker.once('message', msg => msg.done ? resolve() : reject(new Error('Worker failed')));
+    worker.once('error', reject);
+    worker.once('exit', code => {
+      if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
+    });
+  });
+}
+
 function getCurrentMinuteKey() {
   const now = new Date();
   return now.toISOString().slice(0, 16);
@@ -15,9 +29,7 @@ function getCurrentMinuteKey() {
 
 function startSchedulerLoop() {
   const now = new Date();
-  const msUntilNextMinute =
-    (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
-
+  const msUntilNextMinute = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
   setTimeout(() => {
     checkAllJobsAndRun();
     setInterval(checkAllJobsAndRun, 60000);
@@ -31,20 +43,18 @@ function checkAllJobsAndRun() {
   const curDayOfWeek = now.getDay();
   const minuteKey = getCurrentMinuteKey();
 
-  jobs.forEach((job) => {
-    if (job.lastRun === minuteKey) {
-      return;
-    }
+  jobs.forEach(job => {
+    if (job.lastRun === minuteKey) return;
 
     let shouldRun = false;
     switch (job.type) {
-      case "hourly":
+      case 'hourly':
         if (curMinute === job.minute) shouldRun = true;
         break;
-      case "daily":
+      case 'daily':
         if (curHour === job.hour && curMinute === job.minute) shouldRun = true;
         break;
-      case "weekly":
+      case 'weekly':
         if (
           curDayOfWeek === job.dayOfWeek &&
           curHour === job.hour &&
@@ -53,74 +63,60 @@ function checkAllJobsAndRun() {
           shouldRun = true;
         }
         break;
-      default:
-        break;
     }
 
     if (shouldRun) {
-      console.log(
-        `[${new Date().toLocaleString()}] Hello World (job #${job.id})`
-      );
       job.lastRun = minuteKey;
+      runJobInWorker(job.id)
+        .catch(err => console.error(`Job #${job.id} failed:`, err));
     }
   });
 }
 
 startSchedulerLoop();
 
-app.get("/jobs", (req, res) => {
+app.get('/jobs', (req, res) => {
   res.json(jobs);
 });
 
-app.post("/jobs", (req, res) => {
+app.post('/jobs', (req, res) => {
   const { type, minute, hour, dayOfWeek } = req.body;
-
-  if (!type || !["hourly", "daily", "weekly"].includes(type)) {
-    return res
-      .status(400)
-      .json({ error: 'type must be "hourly", "daily", or "weekly"' });
+  if (!type || !['hourly', 'daily', 'weekly'].includes(type)) {
+    return res.status(400).json({ error: 'type must be "hourly", "daily", or "weekly"' });
   }
-
-  if (type === "hourly") {
-    if (typeof minute !== "number" || minute < 0 || minute > 59) {
-      return res
-        .status(400)
-        .json({ error: "For hourly jobs, minute must be 0–59" });
+  if (type === 'hourly') {
+    if (typeof minute !== 'number' || minute < 0 || minute > 59) {
+      return res.status(400).json({ error: 'For hourly jobs, minute must be 0–59' });
     }
   }
-
-  if (type === "daily") {
+  if (type === 'daily') {
     if (
-      typeof hour !== "number" ||
+      typeof hour !== 'number' ||
       hour < 0 ||
       hour > 23 ||
-      typeof minute !== "number" ||
+      typeof minute !== 'number' ||
       minute < 0 ||
       minute > 59
     ) {
       return res
         .status(400)
-        .json({
-          error: "For daily jobs, hour 0–23 and minute 0–59 are required",
-        });
+        .json({ error: 'For daily jobs, hour 0–23 and minute 0–59 are required' });
     }
   }
-
-  if (type === "weekly") {
+  if (type === 'weekly') {
     if (
-      typeof dayOfWeek !== "number" ||
+      typeof dayOfWeek !== 'number' ||
       dayOfWeek < 0 ||
       dayOfWeek > 6 ||
-      typeof hour !== "number" ||
+      typeof hour !== 'number' ||
       hour < 0 ||
       hour > 23 ||
-      typeof minute !== "number" ||
+      typeof minute !== 'number' ||
       minute < 0 ||
       minute > 59
     ) {
       return res.status(400).json({
-        error:
-          "For weekly jobs, dayOfWeek 0–6 (0=Sunday), hour 0–23, minute 0–59 are required",
+        error: 'For weekly jobs, dayOfWeek 0–6 (0=Sunday), hour 0–23, minute 0–59 are required',
       });
     }
   }
@@ -129,23 +125,19 @@ app.post("/jobs", (req, res) => {
     id: nextJobId++,
     type: type,
     minute: minute,
-    hour: type === "daily" || type === "weekly" ? hour : undefined,
-    dayOfWeek: type === "weekly" ? dayOfWeek : undefined,
-    lastRun: null,
+    hour: (type === 'daily' || type === 'weekly') ? hour : undefined,
+    dayOfWeek: (type === 'weekly') ? dayOfWeek : undefined,
+    lastRun: null
   };
 
   jobs.push(newJob);
   return res.status(201).json(newJob);
 });
 
-app.delete("/jobs/:id", (req, res) => {
+app.delete('/jobs/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const idx = jobs.findIndex((j) => j.id === id);
-
-  if (idx === -1) {
-    return res.status(404).json({ error: "Job not found" });
-  }
-
+  const idx = jobs.findIndex(j => j.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Job not found' });
   const removed = jobs.splice(idx, 1)[0];
   return res.json({ deleted: removed });
 });
